@@ -1,0 +1,810 @@
+#include <stdint.h>
+#include <string.h>
+#include "nordic_common.h"
+#include "nrf.h"
+#include "app_error.h"
+#include "nrf_gpio.h"
+#include "ble.h"
+#include "ble_hci.h"
+#include "ble_srv_common.h"
+#include "ble_advdata.h"
+#include "softdevice_handler.h"
+#include "app_timer.h"
+#include "bsp.h"
+
+#define IS_SRVC_CHANGED_CHARACT_PRESENT     0                                       /**< Include or not the service_changed characteristic. if not enabled, the server's database cannot be changed for the lifetime of the device*/
+
+#define CENTRAL_LINK_COUNT                  0                                       /**<number of central links used by the application. When changing this number remember to adjust the RAM settings*/
+#define PERIPHERAL_LINK_COUNT               1                                       /**<number of peripheral links used by the application. When changing this number remember to adjust the RAM settings*/
+
+#define APP_CFG_NON_CONN_ADV_TIMEOUT  30                                            /**< Time for which the device must be advertising in non-connectable mode (in seconds). */
+#define APP_CFG_CHAR_NOTIF_TIMEOUT    5000                                          /**< Time for which the device must continue to send notifications once connected to central (in milli seconds). */
+#define APP_CFG_ADV_DATA_LEN          31                                            /**< Required length of the complete advertisement packet. This should be atleast 8 in order to accommodate flag field and other mandatory fields and one byte of manufacturer specific data. */
+#define APP_CFG_CONNECTION_INTERVAL   20                                            /**< Connection interval used by the central (in milli seconds). This application will be sending one notification per connection interval. A repeating timer will be started with timeout value equal to this value and one notification will be sent everytime this timer expires. */
+#define APP_CFG_CHAR_LEN              20                                            /**< Size of the characteristic value being notified (in bytes). */
+
+#define NOTIF_BUTTON_ID               0                                             /**< Button used for initializing the application in connectable mode. */
+#define NON_CONN_ADV_BUTTON_ID        1                                             /**< Button used for initializing the application in non-connectable mode. */
+
+#define DEVICE_NAME                   "SAFAUD_EQUALIZER_V2"                           /**< Name of device. Will be included in the advertising data. */
+
+#define APP_TIMER_PRESCALER           0                                             /**< Value of the RTC1 PRESCALER register. */
+#define APP_TIMER_OP_QUEUE_SIZE       4                                             /**< Size of timer operation queues. */
+
+#define CHAR_NOTIF_TIMEOUT_IN_TKS     APP_TIMER_TICKS(APP_CFG_CHAR_NOTIF_TIMEOUT,\
+APP_TIMER_PRESCALER)          /**< Time for which the device must continue to send notifications once connected to central (in ticks). */
+
+#define CONNECTABLE_ADV_INTERVAL      MSEC_TO_UNITS(20, UNIT_0_625_MS)              /**< The advertising interval for connectable advertisement (20 ms). This value can vary between 20ms to 10.24s. */
+#define NON_CONNECTABLE_ADV_INTERVAL  MSEC_TO_UNITS(100, UNIT_0_625_MS)             /**< The advertising interval for non-connectable advertisement (100 ms). This value can vary between 100ms to 10.24s). */
+#define CONNECTABLE_ADV_TIMEOUT       30                                            /**< Time for which the device must be advertising in connectable mode (in seconds). */
+
+#define SLAVE_LATENCY                 0                                             /**< Slave latency. */
+#define CONN_SUP_TIMEOUT              MSEC_TO_UNITS(4000, UNIT_10_MS)               /**< Connection supervisory timeout (4 seconds). */
+
+#define ADV_ENCODED_AD_TYPE_LEN       1                                             /**< Length of encoded ad type in advertisement data. */
+#define ADV_ENCODED_AD_TYPE_LEN_LEN   1                                             /**< Length of the 'length field' of each ad type in advertisement data. */
+#define ADV_FLAGS_LEN                 1                                             /**< Length of flags field that will be placed in advertisement data. */
+#define ADV_ENCODED_FLAGS_LEN         (ADV_ENCODED_AD_TYPE_LEN +       \
+ADV_ENCODED_AD_TYPE_LEN_LEN +   \
+ADV_FLAGS_LEN)                               /**< Length of flags field in advertisement packet. (1 byte for encoded ad type plus 1 byte for length of flags plus the length of the flags itself). */
+#define ADV_ENCODED_COMPANY_ID_LEN    2                                             /**< Length of the encoded Company Identifier in the Manufacturer Specific Data part of the advertisement data. */
+#define ADV_ADDL_MANUF_DATA_LEN       (APP_CFG_ADV_DATA_LEN -                \
+(                                     \
+ADV_ENCODED_FLAGS_LEN +           \
+(                                 \
+ADV_ENCODED_AD_TYPE_LEN +     \
+ADV_ENCODED_AD_TYPE_LEN_LEN + \
+ADV_ENCODED_COMPANY_ID_LEN    \
+)                                 \
+)                                     \
+)                                             /**< Length of Manufacturer Specific Data field that will be placed on the air during advertisement. This is computed based on the value of APP_CFG_ADV_DATA_LEN (required advertisement data length). */
+
+#if APP_CFG_ADV_DATA_LEN > BLE_GAP_ADV_MAX_SIZE
+#error "The required advertisement data size (APP_CFG_ADV_DATA_LEN) is greater than the value allowed by stack (BLE_GAP_ADV_MAX_SIZE). Reduce the value of APP_CFG_ADV_DATA_LEN and recompile."
+#endif
+
+#if (APP_CFG_CHAR_LEN + 1 + 2) > BLE_L2CAP_MTU_DEF
+#error "The APP_CFG_CHAR_LEN is too large for the maximum MTU size."
+#endif
+
+#if ADV_ADDL_MANUF_DATA_LEN < 1
+#error "The required length of additional manufacturer specific data computed based on the user configured values is computed to be less than 1. Consider increasing the value of APP_CFG_ADV_DATA_LEN."
+#endif
+
+#define COMPANY_IDENTIFIER            0x0059                                        /**< Company identifier for Nordic Semiconductor ASA as per www.bluetooth.org. */
+
+#define LOCAL_SERVICE_UUID            0x1523                                        /**< Proprietary UUID for local service. */
+#define LOCAL_CHAR_UUID               0x1524                                        /**< Proprietary UUID for local characteristic. */
+
+#define DEAD_BEEF                     0xDEADBEEF                                    /**< Value used as error code on stack dump, can be used to identify stack location on stack unwind. */
+
+/**@brief 128-bit UUID base List. */
+static const ble_uuid128_t m_base_uuid128 =
+{
+    {
+        0x23, 0xD1, 0xBC, 0xEA, 0x5F, 0x78, 0x23, 0x15,
+        0xDE, 0xEF, 0x12, 0x12, 0x00, 0x00, 0x00, 0x00
+    }
+};
+
+static ble_gap_adv_params_t     m_adv_params;                                       /**< Parameters to be passed to the stack when starting advertising. */
+static uint8_t                  m_char_value[APP_CFG_CHAR_LEN];                     /**< Value of the characteristic that will be sent as a notification to the central. */
+static uint8_t                  m_addl_adv_manuf_data[ADV_ADDL_MANUF_DATA_LEN];     /**< Value of the additional manufacturer specific data that will be placed in air (initialized to all zeros). */
+static ble_gatts_char_handles_t m_char_handles;                                     /**< Handles of local characteristic (as provided by the BLE stack).*/
+static uint16_t                 m_conn_handle = BLE_CONN_HANDLE_INVALID;            /**< Handle of the current connection (as provided by the BLE stack, is BLE_CONN_HANDLE_INVALID if not in a connection).*/
+static uint16_t                 m_service_handle;                                   /**< Handle of local service (as provided by the BLE stack).*/
+static bool                     m_is_notifying_enabled = false;                     /**< Variable to indicate whether the notification is enabled by the peer.*/
+APP_TIMER_DEF(m_conn_int_timer_id);                                                 /**< Connection interval timer. */
+APP_TIMER_DEF(m_notif_timer_id);                                                    /**< Notification timer. */
+
+void assert_nrf_callback(uint16_t line_num, const uint8_t * p_file_name)
+{
+    app_error_handler(DEAD_BEEF, line_num, p_file_name);
+}
+
+
+
+//=====================================UART================================================//
+
+
+#include "app_uart.h"
+#include "nrf_drv_gpiote.h"
+#include "nrf_delay.h"
+
+
+#define RX_PIN_NUMBER  5
+#define TX_PIN_NUMBER  6
+
+#define RX_PIN_NUMBER_DK  8
+#define TX_PIN_NUMBER_DK  6
+
+#define CTS_PIN_NUMBER 0
+#define RTS_PIN_NUMBER 0
+#define UART_TX_BUF_SIZE 256 /**< UART TX buffer size. */
+#define UART_RX_BUF_SIZE 256   /**<  UART RX buffer size. */
+
+void uart_events_handler(app_uart_evt_t * p_event)
+{
+    if(p_event->evt_type == APP_UART_DATA_READY)
+    {
+        uint8_t cr;
+        app_uart_get(&cr);          //rx_buff -> cr
+        app_uart_put(cr);            //cr -> tx_buff
+    }
+}
+
+void uart_config(void)
+{
+    uint32_t                     err_code;
+    const app_uart_comm_params_t comm_params =
+    {
+        0, //RX_PIN_NUMBER_DK,
+        0, //TX_PIN_NUMBER_DK,
+        RTS_PIN_NUMBER,
+        CTS_PIN_NUMBER,
+        APP_UART_FLOW_CONTROL_ENABLED,
+        false,
+        //        UART_BAUDRATE_BAUDRATE_Baud115200
+        UART_BAUDRATE_BAUDRATE_Baud230400
+        //        UART_BAUDRATE_BAUDRATE_Baud1M
+    };
+    APP_UART_FIFO_INIT(&comm_params,
+                       UART_RX_BUF_SIZE,
+                       UART_TX_BUF_SIZE,
+                       uart_events_handler,
+                       APP_IRQ_PRIORITY_LOW,
+                       err_code);
+    APP_ERROR_CHECK(err_code);
+}
+
+
+
+
+//=====================================UART================================================//
+
+//=====================================BLE================================================//
+
+static void notify(uint8_t *data, uint8_t lenth)
+{
+    uint32_t err_code;
+    uint16_t len = APP_CFG_CHAR_LEN;
+    
+    // Send value if connected and notifying.
+    if ((m_conn_handle != BLE_CONN_HANDLE_INVALID) && m_is_notifying_enabled)
+    {
+        ble_gatts_hvx_params_t hvx_params;
+        
+        memset(&hvx_params, 0, sizeof(hvx_params));
+        len = lenth;
+        
+        hvx_params.handle   = m_char_handles.value_handle;
+        hvx_params.type     = BLE_GATT_HVX_NOTIFICATION;
+        hvx_params.offset   = 0;
+        hvx_params.p_len    = &len;
+        hvx_params.p_data   = data;
+        
+        err_code = sd_ble_gatts_hvx(m_conn_handle, &hvx_params);
+        if ((err_code != NRF_SUCCESS) &&
+            (err_code != NRF_ERROR_INVALID_STATE) &&
+            (err_code != BLE_ERROR_NO_TX_PACKETS) &&
+            (err_code != BLE_ERROR_GATTS_SYS_ATTR_MISSING)
+            )
+        {
+            APP_ERROR_HANDLER(err_code);
+        }
+    }
+}
+
+//=====================================BLE================================================//
+
+
+static void char_notify(void)
+{
+    uint32_t err_code;
+    uint16_t len = APP_CFG_CHAR_LEN;
+    
+    // Send value if connected and notifying.
+    if ((m_conn_handle != BLE_CONN_HANDLE_INVALID) && m_is_notifying_enabled)
+    {
+        ble_gatts_hvx_params_t hvx_params;
+        
+        memset(&hvx_params, 0, sizeof(hvx_params));
+        len = sizeof(uint8_t);
+        
+        hvx_params.handle   = m_char_handles.value_handle;
+        hvx_params.type     = BLE_GATT_HVX_NOTIFICATION;
+        hvx_params.offset   = 0;
+        hvx_params.p_len    = &len;
+        hvx_params.p_data   = m_char_value;
+        
+        err_code = sd_ble_gatts_hvx(m_conn_handle, &hvx_params);
+        if ((err_code != NRF_SUCCESS) &&
+            (err_code != NRF_ERROR_INVALID_STATE) &&
+            (err_code != BLE_ERROR_NO_TX_PACKETS) &&
+            (err_code != BLE_ERROR_GATTS_SYS_ATTR_MISSING)
+            )
+        {
+            APP_ERROR_HANDLER(err_code);
+        }
+    }
+}
+
+
+static void gap_params_init(void)
+{
+    uint32_t                err_code;
+    ble_gap_conn_params_t   gap_conn_params;
+    ble_gap_conn_sec_mode_t sec_mode;
+    
+    BLE_GAP_CONN_SEC_MODE_SET_OPEN(&sec_mode);
+    
+    err_code = sd_ble_gap_device_name_set(&sec_mode,
+                                          (const uint8_t *)DEVICE_NAME,
+                                          strlen(DEVICE_NAME));
+    APP_ERROR_CHECK(err_code);
+    
+    memset(&gap_conn_params, 0, sizeof(gap_conn_params));
+    
+    // Set GAP Peripheral Preferred Connection Parameters (converting connection interval from
+    // milliseconds to required unit of 1.25ms).
+    gap_conn_params.min_conn_interval = (4 * APP_CFG_CONNECTION_INTERVAL) / 5;
+    gap_conn_params.max_conn_interval = (4 * APP_CFG_CONNECTION_INTERVAL) / 5;
+    gap_conn_params.slave_latency     = SLAVE_LATENCY;
+    gap_conn_params.conn_sup_timeout  = CONN_SUP_TIMEOUT;
+    
+    err_code = sd_ble_gap_ppcp_set(&gap_conn_params);
+    APP_ERROR_CHECK(err_code);
+}
+
+
+static void connectable_adv_init(void)
+{
+    // Initialize advertising parameters (used when starting advertising).
+    memset(&m_adv_params, 0, sizeof(m_adv_params));
+    
+    m_adv_params.type        = BLE_GAP_ADV_TYPE_ADV_IND ;
+    m_adv_params.p_peer_addr = NULL;                               // Undirected advertisement
+    m_adv_params.fp          = BLE_GAP_ADV_FP_ANY;
+    m_adv_params.interval    = CONNECTABLE_ADV_INTERVAL;
+    m_adv_params.timeout     = CONNECTABLE_ADV_TIMEOUT;
+}
+
+static void non_connectable_adv_init(void)
+{
+    // Initialize advertising parameters (used when starting advertising).
+    memset(&m_adv_params, 0, sizeof(m_adv_params));
+    
+    m_adv_params.type        = BLE_GAP_ADV_TYPE_ADV_NONCONN_IND;
+    m_adv_params.p_peer_addr = NULL;                               // Undirected advertisement
+    m_adv_params.fp          = BLE_GAP_ADV_FP_ANY;
+    m_adv_params.interval    = NON_CONNECTABLE_ADV_INTERVAL;
+    m_adv_params.timeout     = APP_CFG_NON_CONN_ADV_TIMEOUT;
+}
+
+
+static void advertising_data_init(void)
+{
+    uint32_t                   err_code;
+    ble_advdata_t              advdata;
+    ble_advdata_manuf_data_t   manuf_data;
+    uint8_t                    flags = BLE_GAP_ADV_FLAGS_LE_ONLY_LIMITED_DISC_MODE;
+    
+    APP_ERROR_CHECK_BOOL(sizeof(flags) == ADV_FLAGS_LEN);  // Assert that these two values of the same.
+    
+    // Build and set advertising data
+    memset(&advdata, 0, sizeof(advdata));
+    
+    manuf_data.company_identifier = COMPANY_IDENTIFIER;
+    manuf_data.data.size          = ADV_ADDL_MANUF_DATA_LEN;
+    manuf_data.data.p_data        = m_addl_adv_manuf_data;
+    advdata.flags                 = flags;
+    advdata.p_manuf_specific_data = &manuf_data;
+    
+    err_code = ble_advdata_set(&advdata, NULL);
+    APP_ERROR_CHECK(err_code);
+}
+
+static void char_add(const uint8_t uuid_type)
+{
+    uint32_t            err_code;
+    ble_gatts_char_md_t char_md;
+    ble_gatts_attr_md_t cccd_md;
+    ble_gatts_attr_t    attr_char_value;
+    ble_uuid_t          char_uuid;
+    ble_gatts_attr_md_t attr_md;
+    
+    memset(&cccd_md, 0, sizeof(cccd_md));
+    
+    cccd_md.vloc = BLE_GATTS_VLOC_STACK;
+    BLE_GAP_CONN_SEC_MODE_SET_OPEN(&cccd_md.read_perm);
+    BLE_GAP_CONN_SEC_MODE_SET_OPEN(&cccd_md.write_perm);
+    
+    memset(&char_md, 0, sizeof(char_md));
+    
+    char_md.char_props.read   = 1;
+    char_md.char_props.notify = 1;
+    char_md.char_props.write = 1;
+    //    char_md.char_props.write_wo_resp = 1;
+    char_md.p_char_user_desc  = NULL;
+    char_md.p_char_pf         = NULL;
+    char_md.p_user_desc_md    = NULL;
+    char_md.p_cccd_md         = &cccd_md;
+    char_md.p_sccd_md         = NULL;
+    
+    char_uuid.type = uuid_type;
+    char_uuid.uuid = LOCAL_CHAR_UUID;
+    
+    memset(&attr_md, 0, sizeof(attr_md));
+    
+    BLE_GAP_CONN_SEC_MODE_SET_OPEN(&attr_md.read_perm);
+    BLE_GAP_CONN_SEC_MODE_SET_OPEN(&attr_md.write_perm);
+    
+    attr_md.vloc    = BLE_GATTS_VLOC_STACK;
+    attr_md.rd_auth = 0;
+    attr_md.wr_auth = 0;
+    attr_md.vlen    = 0;
+    
+    memset(&attr_char_value, 0, sizeof(attr_char_value));
+    
+    attr_char_value.p_uuid    = &char_uuid;
+    attr_char_value.p_attr_md = &attr_md;
+    attr_char_value.init_len  = APP_CFG_CHAR_LEN;
+    attr_char_value.init_offs = 0;
+    attr_char_value.max_len   = APP_CFG_CHAR_LEN;
+    attr_char_value.p_value   = m_char_value;
+    
+    err_code = sd_ble_gatts_characteristic_add(m_service_handle,
+                                               &char_md,
+                                               &attr_char_value,
+                                               &m_char_handles);
+    APP_ERROR_CHECK(err_code);
+}
+
+static void service_add(void)
+{
+    ble_uuid_t  service_uuid;
+    uint32_t    err_code;
+    
+    service_uuid.uuid = LOCAL_SERVICE_UUID;
+    
+    err_code = sd_ble_uuid_vs_add(&m_base_uuid128, &service_uuid.type);
+    APP_ERROR_CHECK(err_code);
+    
+    err_code = sd_ble_gatts_service_add(BLE_GATTS_SRVC_TYPE_PRIMARY, &service_uuid, &m_service_handle);
+    APP_ERROR_CHECK(err_code);
+    
+    // Add characteristics
+    char_add(service_uuid.type);
+}
+
+static void connection_interval_timeout_handler(void * p_context)
+{
+    UNUSED_PARAMETER(p_context);
+    
+    // Into next connection interval. Send one notification.
+    char_notify();
+}
+
+
+static void application_timers_start(void)
+{
+    uint32_t err_code;
+    
+    // Start connection interval timer.
+    err_code = app_timer_start(m_conn_int_timer_id,
+                               APP_TIMER_TICKS(APP_CFG_CONNECTION_INTERVAL, APP_TIMER_PRESCALER),
+                               NULL);
+    APP_ERROR_CHECK(err_code);
+    
+}
+
+static void application_timers_stop(void)
+{
+    uint32_t err_code;
+    
+    err_code = app_timer_stop(m_conn_int_timer_id);
+    APP_ERROR_CHECK(err_code);
+}
+
+
+static void advertising_start(void)
+{
+    uint32_t err_code;
+    
+    err_code = sd_ble_gap_adv_start(&m_adv_params);
+    APP_ERROR_CHECK(err_code);
+}
+
+
+static void timers_init(void)
+{
+    uint32_t err_code;
+    
+    // Initialize timer module
+    APP_TIMER_INIT(APP_TIMER_PRESCALER, APP_TIMER_OP_QUEUE_SIZE, false);
+    
+    // Create timers
+    err_code = app_timer_create(&m_conn_int_timer_id,
+                                APP_TIMER_MODE_REPEATED,
+                                connection_interval_timeout_handler);
+    APP_ERROR_CHECK(err_code);
+    
+}
+
+void setValue( uint8_t *receiveValue );
+static void on_write(ble_evt_t * p_ble_evt)
+{
+    ble_gatts_evt_write_t * p_evt_write = &p_ble_evt->evt.gatts_evt.params.write;
+    
+    if ((p_evt_write->handle == m_char_handles.cccd_handle) && (p_evt_write->len == 2))
+    {
+        // CCCD written. Start notifications
+        m_is_notifying_enabled = ble_srv_is_notification_enabled(p_evt_write->data);
+        
+        if (m_is_notifying_enabled)
+        {
+            application_timers_start();
+            char_notify();
+        }
+        else
+        {
+            application_timers_stop();
+        }
+    }else{
+        
+        //        for (int i = 0 ; i < p_evt_write->len ; i++ ){
+        //            printf("%02x ",p_evt_write->data[i]);
+        //        }
+        //        printf("\n\r");
+        
+        if (p_evt_write->len == 12 ) {
+            setValue(p_evt_write->data);
+        }
+        
+    }
+}
+
+
+static void on_ble_evt(ble_evt_t * p_ble_evt)
+{
+    uint32_t err_code;
+    
+    switch (p_ble_evt->header.evt_id)
+    {
+        case BLE_GAP_EVT_CONNECTED:
+            m_conn_handle = p_ble_evt->evt.gap_evt.conn_handle;
+            break;
+            
+        case BLE_GAP_EVT_DISCONNECTED:
+            m_conn_handle = BLE_CONN_HANDLE_INVALID;
+            advertising_start();
+            break;
+            
+        case BLE_GATTS_EVT_SYS_ATTR_MISSING:
+            err_code = sd_ble_gatts_sys_attr_set(m_conn_handle,
+                                                 NULL,
+                                                 0,
+                                                 BLE_GATTS_SYS_ATTR_FLAG_SYS_SRVCS | BLE_GATTS_SYS_ATTR_FLAG_USR_SRVCS);
+            APP_ERROR_CHECK(err_code);
+            break;
+            
+        case BLE_GAP_EVT_TIMEOUT:
+            if (p_ble_evt->evt.gap_evt.params.timeout.src == BLE_GAP_TIMEOUT_SRC_ADVERTISING)
+            {
+                advertising_start();
+            }
+            break;
+            
+        case BLE_GATTS_EVT_WRITE:
+            on_write(p_ble_evt);
+            break;
+            
+        default:
+            // No implementation needed.
+            break;
+    }
+}
+
+
+static void ble_evt_dispatch(ble_evt_t * p_ble_evt)
+{
+    on_ble_evt(p_ble_evt);
+}
+
+static void sys_evt_dispatch(uint32_t sys_evt)
+{
+    
+}
+
+
+static void ble_stack_init(void)
+{
+    uint32_t err_code;
+    
+    // Initialize the SoftDevice handler module.
+    SOFTDEVICE_HANDLER_INIT(NRF_CLOCK_LFCLKSRC_XTAL_20_PPM, NULL);
+    
+    ble_enable_params_t ble_enable_params;
+    err_code = softdevice_enable_get_default_config(CENTRAL_LINK_COUNT,
+                                                    PERIPHERAL_LINK_COUNT,
+                                                    &ble_enable_params);
+    APP_ERROR_CHECK(err_code);
+    
+    //Check the ram settings against the used number of links
+    CHECK_RAM_START_ADDR(CENTRAL_LINK_COUNT,PERIPHERAL_LINK_COUNT);
+    
+    // Enable BLE stack.
+    err_code = softdevice_enable(&ble_enable_params);
+    APP_ERROR_CHECK(err_code);
+    
+    // Register with the SoftDevice handler module for BLE events.
+    err_code = softdevice_ble_evt_handler_set(ble_evt_dispatch);
+    APP_ERROR_CHECK(err_code);
+    
+    // Register with the SoftDevice handler module for BLE events.
+    err_code = softdevice_sys_evt_handler_set(sys_evt_dispatch);
+    APP_ERROR_CHECK(err_code);
+}
+
+
+static void power_manage(void)
+{
+    uint32_t err_code = sd_app_evt_wait();
+    APP_ERROR_CHECK(err_code);
+}
+
+static void power_system_off(void)
+{
+    uint32_t err_code = sd_power_system_off();
+    APP_ERROR_CHECK(err_code);
+}
+
+//
+
+
+#define CLK_ON_L        nrf_gpio_pin_write(20,1) //(PORTB = (PORTB & 0xDF) | 0x20)            // Clock High (PORTB BIT5)
+#define CLK_OFF_L       nrf_gpio_pin_write(20,0) // (PORTB = (PORTB & 0xDF))                // Clock Low (PORTB BIT5)
+#define START_HIG_L     nrf_gpio_pin_write(21,1) //(PORTB = (PORTB & 0xBF) | 0x40)            // Start High (PORTB BIT6)
+#define START_LOW_L     nrf_gpio_pin_write(21,0) //(PORTB = (PORTB & 0xBF))                // Start Low (PORTB BIT6)
+
+#define CLK_ON_R        nrf_gpio_pin_write(22,1) //(PORTB = (PORTB & 0xDF) | 0x20)            // Clock High (PORTB BIT5)
+#define CLK_OFF_R       nrf_gpio_pin_write(22,0) // (PORTB = (PORTB & 0xDF))                // Clock Low (PORTB BIT5)
+#define START_HIG_R     nrf_gpio_pin_write(23,1) //(PORTB = (PORTB & 0xBF) | 0x40)            // Start High (PORTB BIT6)
+#define START_LOW_R     nrf_gpio_pin_write(23,0) //(PORTB = (PORTB & 0xBF))                // Start Low (PORTB BIT6)
+
+//Equalizer Band Define(12-Band, D0 ~ D7 ≫∏∑Œ ∞?≤?∑Œ º≥∞E)
+#define NOBAND        0x03        // No Band Selection
+#define BAND1        0x83        // Band 1, 16Hz
+#define BAND2        0x43        // Band 2, 31.5Hz
+#define BAND3        0xC3        // Band 3, 63Hz
+#define BAND4        0x23        // Band 4, 125Hz
+#define BAND5        0xA3        // Band 5, 250Hz
+#define BAND6        0x63        // Band 6, 500Hz
+#define BAND7        0xE3        // Band 7, 1kHz
+#define BAND8        0x13        // Band 8, 2kHz
+#define BAND9        0x93        // Band 9, 4kHz
+#define BAND10        0x53        // Band 10, 8kHz
+#define BAND11        0xD3        // Band 11, 16kHz
+#define BAND12        0x33        // Band 12, 32kHz
+
+// Equalizer Gain Define(-12dB ~ +12dB)
+#define ZR            0x02        // Flat
+#define P1            0x06        // +1dB
+#define P2            0x0A        // +2dB
+#define P3            0x12        // +3dB
+#define P4            0x22        // +4dB
+#define P5            0x42        // +5dB
+#define P6            0x4A        // +6dB
+#define P7            0x56        // +7dB
+#define P8            0x6A        // +8dB
+#define P9            0x82        // +9dB
+#define P10            0x96        // +10dB
+#define P11            0xB6        // +11dB
+#define P12            0xF6        // +12dB
+#define M1            0x04        // -1dB
+#define M2            0x08        // -2dB
+#define M3            0x10        // -3dB
+#define M4            0x20        // -4dB
+#define M5            0x40        // -5dB
+#define M6            0x48        // -6dB
+#define M7            0x54        // -7dB
+#define M8            0x68        // -8dB
+#define M9            0x80        // -9dB
+#define M10            0x94        // -10dB
+#define M11            0xB4        // -11dB
+#define M12            0xF4        // -12dB
+
+
+uint8_t band[12] = {0};
+uint8_t gain[25] = {0};
+
+void pinInit(){
+    
+    for ( int i = 3 ; i < 18 ; i++) {
+        nrf_gpio_cfg_output(i);
+    }
+
+    
+    nrf_gpio_cfg_output(11);
+    nrf_gpio_cfg_output(12);
+    
+    
+    nrf_gpio_cfg_output(30);
+    nrf_gpio_cfg_output(31);
+    
+    band[0] = BAND1;
+    band[1] = BAND2;
+    band[2] = BAND3;
+    band[3] = BAND4;
+    band[4] = BAND5;
+    band[5] = BAND6;
+    band[6] = BAND7;
+    band[7] = BAND8;
+    band[8] = BAND9;
+    band[9] = BAND10;
+    band[10] = BAND11;
+    band[11] = BAND12;
+    
+    /*
+     -12 ~ 12
+     0 ~ 24
+     
+     +12
+     */
+    
+    
+    gain[0] = M12;
+    gain[1] = M11;
+    gain[2] = M10;
+    gain[3] = M9;
+    gain[4] = M8;
+    gain[5] = M7;
+    gain[6] = M6;
+    gain[7] = M5;
+    gain[8] = M4;
+    gain[9] = M3;
+    gain[10] = M2;
+    gain[11] = M1;
+    
+    gain[12] = ZR;
+    
+    gain[13] = P1;
+    gain[14] = P2;
+    gain[15] = P3;
+    gain[16] = P4;
+    gain[17] = P5;
+    gain[18] = P6;
+    gain[19] = P7;
+    gain[20] = P8;
+    gain[21] = P9;
+    gain[22] = P10;
+    gain[23] = P11;
+    gain[24] = P12;
+    
+    
+    
+}
+
+void PORTC_L(uint8_t value){
+	PORTC(value, 3)
+}
+
+void PORTC_R(uint_t value) {
+	PORTC(value, 11)
+}	
+
+void PORTC(uint8_t value, int sindex){
+    for ( int i = sindex ; i < sindex+8 ; i++){
+        bool newValue = (value & (0x01 << i)) == (0x01 << i);        
+         nrf_gpio_pin_write(i,newValue);
+
+    }
+    //    printf("\n\r");
+}
+
+
+
+
+
+void CLK(int T_Delay)
+{
+    CLK_ON;
+    nrf_delay_ms(1);
+    CLK_OFF;
+    nrf_delay_ms(1);
+}
+
+
+void EqualizerFunc_(unsigned int BAND, unsigned int GAIN)
+{
+    //    printf("BAND : %d\n\r",BAND);
+    for (int k = 0; k <= 11; k++)
+    {
+        CLK(1);
+        START_HIGH;
+        
+        if (k >= 10)
+        {
+            PORTC(BAND);
+            START_LOW;
+        }
+    }
+    
+    //    printf("GAIN : %d\n\r",GAIN);
+    for (int kk = 0; kk <= 20; kk++)
+    {
+        CLK(1);
+        START_HIGH;
+        
+        if (kk >= 10 && kk < 11)
+        {
+            PORTC(GAIN);
+            START_LOW;
+        }
+        else
+        {
+            START_HIGH;
+        }
+    }
+    
+}
+
+void setValue( uint8_t *receiveValue ){
+    for (int i = 0 ; i < 12 ; i++){
+        //        printf("i : %d, value : %d\n\r",i,receiveValue[i]);
+        uint8_t gainIndex = receiveValue[i] - 109 + 12;
+        //        printf("receiveValue[i] : %d, gainIndex : %d\n\r",receiveValue[i],gainIndex);
+        //        printf("%d",receiveValue[i]);
+        printf("%d",gainIndex);
+        if (gainIndex > 24) {
+            gainIndex = 24;
+        }else if(gainIndex < 0){
+            gainIndex = 0;
+        }
+        EqualizerFunc(band[i], gain[gainIndex]);
+    }
+    printf("end\n\r");
+}
+
+//
+
+
+
+int main(void)
+{
+    uint32_t err_code;
+    
+    timers_init();
+    
+    uart_config();
+    
+    ble_stack_init();
+    gap_params_init();
+    connectable_adv_init();
+    service_add();
+    advertising_data_init();
+    advertising_start();
+    
+    pinInit();
+    
+    printf("start\n\r");
+
+    EqualizerFunc(BAND1, ZR);
+    EqualizerFunc(BAND2, ZR);
+    EqualizerFunc(BAND3, ZR);
+    EqualizerFunc(BAND4, ZR);
+    EqualizerFunc(BAND5, ZR);
+    EqualizerFunc(BAND6, ZR);
+    EqualizerFunc(BAND7, ZR);
+    EqualizerFunc(BAND8, ZR);
+    EqualizerFunc(BAND9, ZR);
+    EqualizerFunc(BAND10, ZR);
+    EqualizerFunc(BAND11, ZR);
+    EqualizerFunc(BAND12, ZR);
+    
+    for (;;)
+    {
+        power_manage();
+    }
+}
+
