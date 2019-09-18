@@ -23,5 +23,18 @@
 이명주파수 검색 알고리즘을 통해 3번의 선택만으로 환자에게 맞는 이명음을 찾을 수 있음
 <br />
 <br />
-<img width="458" alt="스크린샷 2019-09-18 오후 5 40 55" src="https://user-images.githubusercontent.com/26424846/65132187-80c79580-da3b-11e9-96c9-ca10ed5c4f2e.png">
-이명 치
+<img width="300" alt="스크린샷 2019-09-18 오후 5 40 55" src="https://user-images.githubusercontent.com/26424846/65132187-80c79580-da3b-11e9-96c9-ca10ed5c4f2e.png">
+이명 치료음을 제공하기위한 화면으로 탐색된 이명주파수를 이용해 Binaural Bests, Narrow Band Noise, Wite Noise, Pink Noise, Brown Noise을 제공
+Binaural Beats란 양쪽 귀에서 들려주는 음의 위상 차를 이용하여 다른 음을 생성
+<br />
+<br />
+<img width="300" alt="스크린샷 2019-09-18 오후 5 47 01" src="https://user-images.githubusercontent.com/26424846/65132775-6b06a000-da3c-11e9-849b-22169640b478.png">
+이명불편감 척도를 조사하기위한 설문조사 화면
+<br />
+<br />
+<img width="300" alt="스크린샷 2019-09-18 오후 5 47 15" src="https://user-images.githubusercontent.com/26424846/65132885-a1dcb600-da3c-11e9-918a-44ab5c9acb67.png">
+시각상사 척도를 조사하기위한 설문조사 화면
+<br />
+<br />
+<img width="300" alt="스크린샷 2019-09-18 오후 5 51 24" src="https://user-images.githubusercontent.com/26424846/65133048-f4b66d80-da3c-11e9-8277-62aadecadbbc.png">
+이명불편감 척도 이력화면으로, 데이터베이스에 입력된 설문조사의 결과를 확인가능
